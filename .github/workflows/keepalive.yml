@@ -1,0 +1,95 @@
+# blitz.cloud —— 部署保活
+# 放到仓库的 .github/workflows/keepalive.yml 即可生效，无需任何密钥配置。
+#
+# 逻辑：每天检查一次，若距离上一次提交已满 5 天，就在 index.html 的 </head>
+#      前刷新一行 <!-- keepalive: ... --> 注释并提交，从而触发平台重新部署。
+#      只改这一行，不动任何其他文件。
+#
+# 注意：提交信息里不要带 [skip ci] / [skip netlify] 之类的标记，
+#      否则 Vercel / Render / Netlify 会跳过部署，保活就失效了。
+
+name: keepalive
+
+on:
+  schedule:
+    # 每天 02:00 UTC（= 北京时间 10:00）检查一次
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '忽略 5 天间隔，强制提交一次'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 判断是否需要保活提交
+        id: gate
+        run: |
+          set -euo pipefail
+          FORCE="${{ github.event.inputs.force || 'false' }}"
+          LAST=$(git log -1 --format=%ct || echo 0)
+          LAST=${LAST:-0}
+          NOW=$(date +%s)
+          AGE_DAYS=$(( (NOW - LAST) / 86400 ))
+          echo "距上次提交：${AGE_DAYS} 天"
+          if [ "$FORCE" = "true" ] || [ "$AGE_DAYS" -ge 5 ]; then
+            echo "run=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "不足 5 天，跳过。"
+          fi
+
+      - name: 刷新 index.html 中的 keepalive 注释
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import re, pathlib, datetime
+
+          p = pathlib.Path('index.html')
+          src = p.read_text(encoding='utf-8')
+
+          # 先抹掉旧的 keepalive 注释（连同前面的换行），再重新插入，保证幂等
+          out = re.sub(r'\n?[ \t]*<!--\s*keepalive:[\s\S]*?-->', '', src)
+
+          now = datetime.datetime.now(datetime.timezone.utc)
+          stamp = '  <!-- keepalive: %s UTC -->' % now.strftime('%Y-%m-%d %H:%M:%S')
+
+          if re.search(r'</head>', out, re.I):
+              out = re.sub(r'</head>', stamp + '\n</head>', out, count=1, flags=re.I)
+          else:
+              out = out.rstrip() + '\n' + stamp + '\n'
+
+          p.write_text(out, encoding='utf-8')
+          print('写入：' + stamp.strip())
+          PY
+
+      - name: 提交并推送
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name  "keepalive-bot"
+          git config user.email "keepalive@users.noreply.github.com"
+          if git diff --quiet; then
+            echo "无改动，跳过提交。"
+            exit 0
+          fi
+          git add index.html
+          git commit -m "chore(keepalive): refresh build stamp - $(date -u '+%Y-%m-%d %H:%M UTC')"
+          git push
+          echo "已推送，等待平台重新部署。"
