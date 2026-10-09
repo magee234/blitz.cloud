@@ -1,9 +1,11 @@
 # blitz.cloud —— 部署保活
 # 放到仓库的 .github/workflows/keepalive.yml 即可生效，无需任何密钥配置。
 #
-# 逻辑：每天检查一次，若距离上一次提交已满 5 天，就在 index.html 的 </head>
-#      前刷新一行 <!-- keepalive: ... --> 注释并提交，从而触发平台重新部署。
-#      只改这一行，不动任何其他文件。
+# 逻辑：每天检查一次，若距离上一次提交已满 5 天，就刷新 index.html 里的构建时间戳
+#      并提交，从而触发平台重新部署。
+#
+#   页面底部会显示一行灰色小字（肉眼可验证是否已重新部署）：
+#       build 2026-10-09 19:19 UTC+8
 #
 # 注意：提交信息里不要带 [skip ci] / [skip netlify] 之类的标记，
 #      否则 Vercel / Render / Netlify 会跳过部署，保活就失效了。
@@ -54,29 +56,57 @@ jobs:
             echo "不足 5 天，跳过。"
           fi
 
-      - name: 刷新 index.html 中的 keepalive 注释
+      - name: 刷新 index.html 中的构建时间戳
         if: steps.gate.outputs.run == 'true'
         run: |
           set -euo pipefail
           python3 - <<'PY'
           import re, pathlib, datetime
 
+          # newline='' 关闭换行符自动转换：
+          # Linux runner 上无影响，但可保证在任何平台上都不会把 LF 改成 CRLF，
+          # 否则一次运行就会把整个文件重写，产生几百行的假 diff。
           p = pathlib.Path('index.html')
-          src = p.read_text(encoding='utf-8')
+          with open(p, 'r', encoding='utf-8', newline='') as f:
+              src = f.read()
 
-          # 先抹掉旧的 keepalive 注释（连同前面的换行），再重新插入，保证幂等
-          out = re.sub(r'\n?[ \t]*<!--\s*keepalive:[\s\S]*?-->', '', src)
+          # 统一用 UTC+8（北京时间）；中国无夏令时，直接偏移即可，不依赖 tzdata
+          now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
+          stamp = now.strftime('%Y-%m-%d %H:%M') + ' UTC+8'
 
-          now = datetime.datetime.now(datetime.timezone.utc)
-          stamp = '  <!-- keepalive: %s UTC -->' % now.strftime('%Y-%m-%d %H:%M:%S')
+          # 1) 清理旧的 keepalive 注释（含历史版本），但不碰 stamp 区块的标记
+          out = re.sub(r'\n?[ \t]*<!--\s*keepalive:(?!stamp)[^>]*?-->', '', src)
 
+          # 2) <head> 里留一行机器可校验的标记
+          head_line = '  <!-- keepalive:build %s -->' % stamp
           if re.search(r'</head>', out, re.I):
-              out = re.sub(r'</head>', stamp + '\n</head>', out, count=1, flags=re.I)
+              out = re.sub(r'</head>', head_line + '\n</head>', out, count=1, flags=re.I)
           else:
-              out = out.rstrip() + '\n' + stamp + '\n'
+              out = out.rstrip() + '\n' + head_line + '\n'
 
-          p.write_text(out, encoding='utf-8')
-          print('写入：' + stamp.strip())
+          # 3) 样式规则（只在缺失时插入一次）
+          if 'keepalive:style' not in out:
+              css = ('  /* keepalive:style */\n'
+                     '  .build-stamp{text-align:center;font-size:12px;color:var(--text-3);'
+                     'letter-spacing:.02em;margin:30px 0 2px;user-select:all;}\n'
+                     '  /* /keepalive:style */')
+              out = re.sub(r'</style>', css + '\n</style>', out, count=1, flags=re.I)
+
+          # 4) 页面底部可见的构建时间（肉眼可验证部署是否已生效）
+          out = re.sub(r'\n?[ \t]*<!--\s*keepalive:stamp:begin\s*-->[\s\S]*?'
+                       r'<!--\s*keepalive:stamp:end\s*-->', '', out)
+          block = ('  <!-- keepalive:stamp:begin -->\n'
+                   '  <div class="build-stamp">build %s</div>\n'
+                   '  <!-- keepalive:stamp:end -->' % stamp)
+          if re.search(r'</main>', out, re.I):
+              out = re.sub(r'</main>', block + '\n</main>', out, count=1, flags=re.I)
+          else:
+              out = out.rstrip() + '\n' + block + '\n'
+
+          if out != src:
+              with open(p, 'w', encoding='utf-8', newline='') as f:
+                  f.write(out)
+          print('stamp: ' + stamp)
           PY
 
       - name: 提交并推送
@@ -90,6 +120,6 @@ jobs:
             exit 0
           fi
           git add index.html
-          git commit -m "chore(keepalive): refresh build stamp - $(date -u '+%Y-%m-%d %H:%M UTC')"
+          git commit -m "chore(keepalive): refresh build stamp - $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M') UTC+8"
           git push
           echo "已推送，等待平台重新部署。"
