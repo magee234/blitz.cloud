@@ -1,11 +1,17 @@
-# blitz.cloud —— 部署保活
+# blitz.cloud —— 免费后台 worker 保活
 # 放到仓库的 .github/workflows/keepalive.yml 即可生效，无需任何密钥配置。
 #
-# 逻辑：每天检查一次，若距离上一次提交已满 5 天，就刷新 index.html 里的构建时间戳
-#      并提交，从而触发平台重新部署。
+# 【为什么是「每天」而不是「每 5 天」】
+# 平台官方邮件里写着：
+#   "your account hasn't been used for 2 days, so we'll stop ..."
+#   保持运行的方式：sign in / deploy a change / open the dashboard
+# ⇒ 判定窗口只有 2 天。5 天跑一次，中间必然有超过 2 天的空档，会被停。
+# 本工作流按「每天 1 次、最大间隔 24 小时」设计，留出一倍余量。
 #
-#   页面底部会显示一行灰色小字（肉眼可验证是否已重新部署）：
-#       build 2026-10-09 19:19 UTC+8
+# 原理：往 index.html 的 </head> 前覆盖写入一行隐形注释并提交。
+#   - index.html 在 Dockerfile 的 COPY 里 ⇒ 必然产生新镜像层 ⇒ 必然触发一次真实部署
+#   - index.js（混淆后的常驻后台脚本）从不读取 index.html ⇒ 改动对运行零影响
+#   - 先删后插 ⇒ 幂等，反复跑不堆积，每次恒定 +1 行
 #
 # 注意：提交信息里不要带 [skip ci] / [skip netlify] 之类的标记，
 #      否则 Vercel / Render / Netlify 会跳过部署，保活就失效了。
@@ -14,12 +20,14 @@ name: keepalive
 
 on:
   schedule:
-    # 每天 02:00 UTC（= 北京时间 10:00）检查一次
-    - cron: '0 2 * * *'
+    # 每天 02:00 与 14:00 UTC（= 北京时间 10:00 与 22:00）。
+    # 之所以跑两次：GitHub 的 cron 在高负载时会延迟、偶尔会丢掉一次，
+    # 两次里只要有一次成功，间隔就不会超过 2 天。
+    - cron: '0 2,14 * * *'
   workflow_dispatch:
     inputs:
       force:
-        description: '忽略 5 天间隔，强制提交一次'
+        description: '忽略间隔判断，强制提交一次'
         type: boolean
         default: false
 
@@ -44,19 +52,22 @@ jobs:
         run: |
           set -euo pipefail
           FORCE="${{ github.event.inputs.force || 'false' }}"
-          LAST=$(git log -1 --format=%ct || echo 0)
+          # 只看「最近一次改动 index.html 的时间」——那才是真正触发过部署的那次提交。
+          # 若用 git log -1 会误判：只改 .github/ 的提交通常不触发平台部署，
+          # 却会把计时器推后，反而造成漏保活。
+          LAST=$(git log -1 --format=%ct -- index.html || echo 0)
           LAST=${LAST:-0}
           NOW=$(date +%s)
-          AGE_DAYS=$(( (NOW - LAST) / 86400 ))
-          echo "距上次提交：${AGE_DAYS} 天"
-          if [ "$FORCE" = "true" ] || [ "$AGE_DAYS" -ge 5 ]; then
+          AGE_HOURS=$(( (NOW - LAST) / 3600 ))
+          echo "距上次改动 index.html：${AGE_HOURS} 小时"
+          if [ "$FORCE" = "true" ] || [ "$AGE_HOURS" -ge 20 ]; then
             echo "run=true"  >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "不足 5 天，跳过。"
+            echo "不足 20 小时，本次跳过。"
           fi
 
-      - name: 刷新 index.html 中的构建时间戳
+      - name: 刷新 index.html 中的时间戳
         if: steps.gate.outputs.run == 'true'
         run: |
           set -euo pipefail
@@ -74,34 +85,24 @@ jobs:
           now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
           stamp = now.strftime('%Y-%m-%d %H:%M') + ' UTC+8'
 
-          # 1) 清理旧的 keepalive 注释（含历史版本），但不碰 stamp 区块的标记
-          out = re.sub(r'\n?[ \t]*<!--\s*keepalive:(?!stamp)[^>]*?-->', '', src)
+          out = src
 
-          # 2) <head> 里留一行机器可校验的标记
-          head_line = '  <!-- keepalive:build %s -->' % stamp
-          if re.search(r'</head>', out, re.I):
-              out = re.sub(r'</head>', head_line + '\n</head>', out, count=1, flags=re.I)
-          else:
-              out = out.rstrip() + '\n' + head_line + '\n'
+          # 1) 抹掉历史版本遗留的可见产物：样式块
+          out = re.sub(r'\n?[ \t]*/\* keepalive:style \*/[\s\S]*?/\* /keepalive:style \*/', '', out)
 
-          # 3) 样式规则（只在缺失时插入一次）
-          if 'keepalive:style' not in out:
-              css = ('  /* keepalive:style */\n'
-                     '  .build-stamp{text-align:center;font-size:12px;color:var(--text-3);'
-                     'letter-spacing:.02em;margin:30px 0 2px;user-select:all;}\n'
-                     '  /* /keepalive:style */')
-              out = re.sub(r'</style>', css + '\n</style>', out, count=1, flags=re.I)
-
-          # 4) 页面底部可见的构建时间（肉眼可验证部署是否已生效）
+          # 2) 抹掉历史版本遗留的可见产物：页面底部时间戳区块
           out = re.sub(r'\n?[ \t]*<!--\s*keepalive:stamp:begin\s*-->[\s\S]*?'
                        r'<!--\s*keepalive:stamp:end\s*-->', '', out)
-          block = ('  <!-- keepalive:stamp:begin -->\n'
-                   '  <div class="build-stamp">build %s</div>\n'
-                   '  <!-- keepalive:stamp:end -->' % stamp)
-          if re.search(r'</main>', out, re.I):
-              out = re.sub(r'</main>', block + '\n</main>', out, count=1, flags=re.I)
+
+          # 3) 抹掉所有 keepalive 注释（含历史格式），下面重新写一行
+          out = re.sub(r'\n?[ \t]*<!--\s*keepalive:[^>]*?-->', '', out)
+
+          # 4) 只在 </head> 前写入这一行隐形注释（先删后插 ⇒ 幂等）
+          line = '  <!-- keepalive: %s -->' % stamp
+          if re.search(r'</head>', out, re.I):
+              out = re.sub(r'</head>', line + '\n</head>', out, count=1, flags=re.I)
           else:
-              out = out.rstrip() + '\n' + block + '\n'
+              out = out.rstrip() + '\n' + line + '\n'
 
           if out != src:
               with open(p, 'w', encoding='utf-8', newline='') as f:
